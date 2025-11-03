@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Single-file Browser Voxel Game</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <style>
+    html,body { height:100%; margin:0; background:#111; overflow:hidden; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+    #hud {
+      position:fixed; left:12px; top:12px; z-index:30;
+      background:rgba(0,0,0,0.45); color:#fff; padding:10px 12px; border-radius:8px;
+      font-family: monospace; font-size:13px;
+    }
+    #hint {
+      position:fixed; left:50%; transform:translateX(-50%); bottom:14px; z-index:30;
+      color:#fff; background:rgba(0,0,0,0.35); padding:8px 12px; border-radius:8px; font-size:13px;
+    }
+    #controls-ui {
+      position:fixed; left:0; right:0; bottom:0; display:flex; justify-content:center; gap:12px;
+      padding:10px; pointer-events:none; z-index:25;
+    }
+    .button {
+      pointer-events:auto;
+      width:58px; height:58px; background:rgba(255,255,255,0.06);
+      border-radius:50%; border:1px solid rgba(255,255,255,0.12);
+      display:flex; align-items:center; justify-content:center; color:#fff; font-size:20px;
+      user-select:none; -webkit-user-select:none; touch-action:manipulation;
+    }
+    @media (pointer: fine) {
+      #controls-ui { display:none; }
+    }
+    canvas { display:block; }
+    a.small { color:#88c; text-decoration:none; margin-left:8px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div id="hud">Loading...</div>
+  <div id="hint">Click to lock pointer. WASD to move, Space jump, Q break, E place. Touch buttons available on mobile.</div>
+
+  <div id="controls-ui">
+    <div class="button" id="btn-break">◀</div>
+    <div class="button" id="btn-jump">↑</div>
+    <div class="button" id="btn-place">▶</div>
+  </div>
+
+  <script type="module">
+    // Single-file browser voxel game (ES module).
+    // Uses Three.js from CDN.
+    import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
+
+    // ---------- Config ----------
+    const WORLD_W = 40, WORLD_H = 24, WORLD_D = 40;
+    const BLOCK_AIR = 0, BLOCK_DIRT = 1;
+    const PLAYER_EYE = 1.6;
+
+    // ---------- Utility ----------
+    function idx(x,y,z,w,d){ return x + w*(z + d*y); }
+
+    // ---------- VoxelWorld (InstancedMesh, single mesh) ----------
+    class VoxelWorld {
+      constructor(w,h,d, scene) {
+        this.w = w; this.h = h; this.d = d;
+        this.size = w*h*d;
+        this.blocks = new Uint8Array(this.size).fill(0);
+        this.instanceIdToCoord = [];
+        this.mesh = null;
+        this._maxInstances = this.size;
+        this._buildMaterialAndMesh();
+        this.generateTerrain();
+        this.updateMesh(); // fill instances initially
+        if(scene) scene.add(this.mesh);
+      }
+
+      _buildMaterialAndMesh(){
+        const box = new THREE.BoxGeometry(1,1,1);
+        const mat = new THREE.MeshLambertMaterial({ vertexColors: false, color: 0x6cbb47 });
+        // create instanced mesh with max instances equal to every voxel (sparse)
+        this.mesh = new THREE.InstancedMesh(box, mat, this._maxInstances);
+        this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        // ensure it can be raycasted and cast/receive shadows
+        this.mesh.castShadow = false;
+        this.mesh.receiveShadow = false;
+      }
+
+      generateTerrain() {
+        // simple height noise-ish terrain
+        for(let x=0;x<this.w;++x){
+          for(let z=0;z<this.d;++z){
+            const h = 3 + Math.floor(4 * (0.5 + 0.5*Math.sin(x*0.18) + 0.5*Math.cos(z*0.15)));
+            for(let y=0;y<h && y<this.h;++y){
+              this.set(x,y,z,BLOCK_DIRT);
+            }
+          }
+        }
+      }
+
+      inBounds(x,y,z){
+        return x>=0 && y>=0 && z>=0 && x<this.w && y<this.h && z<this.d;
+      }
+
+      get(x,y,z){
+        if(!this.inBounds(x,y,z)) return BLOCK_AIR;
+        return this.blocks[idx(x,y,z,this.w,this.d)];
+      }
+
+      set(x,y,z, val){
+        if(!this.inBounds(x,y,z)) return;
+        this.blocks[idx(x,y,z,this.w,this.d)] = val;
+      }
+
+      updateMesh(){
+        // Rebuild instanced matrices and mapping.
+        const tmpMat = new THREE.Matrix4();
+        let i = 0;
+        this.instanceIdToCoord.length = 0;
+        for(let x=0;x<this.w;++x){
+          for(let y=0;y<this.h;++y){
+            for(let z=0;z<this.d;++z){
+              if(this.get(x,y,z) !== BLOCK_AIR){
+                tmpMat.makeTranslation(x+0.5, y+0.5, z+0.5);
+                this.mesh.setMatrixAt(i, tmpMat);
+                this.instanceIdToCoord[i] = {x,y,z};
+                i++;
+              }
+            }
+          }
+        }
+        // set count of visible instances
+        this.mesh.count = i;
+        this.mesh.instanceMatrix.needsUpdate = true;
+        this.mesh.frustumCulled = false; // simple - can be optimized
+      }
+    }
+
+    // ---------- Input and Controls ----------
+    const inputState = {
+      fw:false,bk:false,lt:false,rt:false, run:false, jump:false,
+      place:false, break:false,
+      pointerLocked:false
+    };
+
+    function setupInput(player, camera){
+      // Pointer lock
+      document.addEventListener('click', ()=>{ document.body.requestPointerLock?.(); });
+      document.addEventListener('pointerlockchange', ()=> {
+        inputState.pointerLocked = (document.pointerLockElement === document.body);
+        if(inputState.pointerLocked){
+          window.addEventListener('mousemove', onMouseMove);
+        } else {
+          window.removeEventListener('mousemove', onMouseMove);
+        }
+      });
+
+      function onMouseMove(e){
+        player.yaw   -= e.movementX * 0.0025;
+        player.pitch -= e.movementY * 0.0025;
+        player.pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, player.pitch));
+      }
+
+      window.addEventListener('keydown', e=>{
+        if(e.code==='KeyW') inputState.fw = true;
+        if(e.code==='KeyS') inputState.bk = true;
+        if(e.code==='KeyA') inputState.lt = true;
+        if(e.code==='KeyD') inputState.rt = true;
+        if(e.code==='ShiftLeft' || e.code==='ShiftRight') inputState.run = true;
+        if(e.code==='Space') inputState.jump = true;
+        if(e.code==='KeyE') inputState.place = true;
+        if(e.code==='KeyQ') inputState.break = true;
+      });
+      window.addEventListener('keyup', e=>{
+        if(e.code==='KeyW') inputState.fw = false;
+        if(e.code==='KeyS') inputState.bk = false;
+        if(e.code==='KeyA') inputState.lt = false;
+        if(e.code==='KeyD') inputState.rt = false;
+        if(e.code==='ShiftLeft' || e.code==='ShiftRight') inputState.run = false;
+        if(e.code==='Space') inputState.jump = false;
+        if(e.code==='KeyE') inputState.place = false;
+        if(e.code==='KeyQ') inputState.break = false;
+      });
+
+      // Mobile buttons
+      const bPlace = document.getElementById('btn-place');
+      const bBreak = document.getElementById('btn-break');
+      const bJump  = document.getElementById('btn-jump');
+      if(bPlace){
+        bPlace.addEventListener('touchstart', e=>{ e.preventDefault(); inputState.place = true; }, {passive:false});
+        bPlace.addEventListener('touchend', e=>{ inputState.place = false; });
+      }
+      if(bBreak){
+        bBreak.addEventListener('touchstart', e=>{ e.preventDefault(); inputState.break = true; }, {passive:false});
+        bBreak.addEventListener('touchend', e=>{ inputState.break = false; });
+      }
+      if(bJump){
+        bJump.addEventListener('touchstart', e=>{ e.preventDefault(); inputState.jump = true; }, {passive:false});
+        bJump.addEventListener('touchend', e=>{ inputState.jump = false; });
+      }
+
+      // A simple touch-to-look: tapping drag on right half rotates camera when pointer not locked
+      let touching = false, lastTouch = null;
+      window.addEventListener('touchstart', (e)=>{
+        if(e.touches.length === 1){
+          touching = true; lastTouch = e.touches[0];
+        }
+      }, {passive:true});
+      window.addEventListener('touchmove', (e)=>{
+        if(!touching || !lastTouch) return;
+        const t = e.touches[0];
+        const dx = t.clientX - lastTouch.clientX;
+        const dy = t.clientY - lastTouch.clientY;
+        // rotate a little
+        player.yaw   -= dx * 0.003;
+        player.pitch -= dy * 0.003;
+        player.pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, player.pitch));
+        lastTouch = t;
+      }, {passive:true});
+      window.addEventListener('touchend', ()=>{ touching=false; lastTouch=null; }, {passive:true});
+    }
+
+    // ---------- Main bootstrap ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+
+    const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    sun.position.set(10, 30, 10);
+    scene.add(sun);
+
+    // World
+    const world = new VoxelWorld(WORLD_W, WORLD_H, WORLD_D, scene);
+
+    // Player
+    const player = {
+      pos: new THREE.Vector3(Math.floor(WORLD_W/2)+0.5, WORLD_H-1 + PLAYER_EYE, Math.floor(WORLD_D/2)+0.5),
+      velocity: new THREE.Vector3(),
+      yaw: 0, pitch: 0,
+      speed: 4.0, jumpVel: 6.0, onGround: false
+    };
+
+    // Controls
+    setupInput(player, camera);
+
+    // Raycaster for block targeting
+    const raycaster = new THREE.Raycaster();
+
+    function getBlockTarget() {
+      camera.updateMatrixWorld();
+      raycaster.setFromCamera({x:0,y:0}, camera);
+      const intersects = raycaster.intersectObject(world.mesh, true);
+      if(intersects.length === 0) return null;
+      const it = intersects[0];
+      // instanceId to block coords is stored in world.instanceIdToCoord
+      const iid = it.instanceId;
+      if(iid === undefined || iid === null) {
+        // fallback: compute from intersection point and normal
+        const p = it.point.clone();
+        const f = it.face.normal.clone();
+        const block = p.clone().addScaledVector(f, -0.5).floor();
+        const target = p.clone().addScaledVector(f, 0.5).floor();
+        return { block: {x:block.x,y:block.y,z:block.z}, target: {x:target.x,y:target.y,z:target.z}, face: f };
+      } else {
+        const block = world.instanceIdToCoord[iid];
+        // face normal (local to mesh) - safe to round components to -1/0/1
+        const fn = it.face.normal;
+        const fx = Math.round(fn.x), fy = Math.round(fn.y), fz = Math.round(fn.z);
+        const target = { x: block.x + fx, y: block.y + fy, z: block.z + fz };
+        return { block: {x:block.x,y:block.y,z:block.z}, target, face: new THREE.Vector3(fx,fy,fz) };
+      }
+    }
+
+    // HUD
+    const hud = document.getElementById('hud');
+    function updateHUD(){
+      hud.innerHTML =
+        `Pos: ${player.pos.x.toFixed(2)}, ${player.pos.y.toFixed(2)}, ${player.pos.z.toFixed(2)}<br>` +
+        `OnGround: ${player.onGround ? 'YES' : 'NO'}<br>` +
+        `Yaw/Pitch: ${(player.yaw*57.2958).toFixed(1)}, ${(player.pitch*57.2958).toFixed(1)}<br>` +
+        `Blocks: ${world.mesh.count}`;
+    }
+
+    // Resize
+    window.addEventListener('resize', ()=>{
+      camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    }, false);
+
+    // Simple collision: checks if at integer cube there is block
+    function collisionAt(pos){
+      const x = Math.floor(pos.x), y = Math.floor(pos.y - 0.001), z = Math.floor(pos.z);
+      return world.get(x,y,z) !== BLOCK_AIR;
+    }
+
+    // Game loop
+    let lastTime = performance.now();
+    function animate(now){
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      // Movement input
+      const forward = inputState.fw ? 1 : (inputState.bk ? -1 : 0);
+      const strafe  = inputState.rt ? 1 : (inputState.lt ? -1 : 0);
+      const run = inputState.run;
+      const speed = player.speed * (run ? 1.8 : 1.0);
+
+      // Orientation vectors
+      const yaw = player.yaw;
+      const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
+
+      let dx = 0, dz = 0;
+      if(forward !== 0 || strafe !== 0){
+        // combine forward and strafe
+        let mvx = (strafe) * cosY + (forward) * sinY;
+        let mvz = (strafe) * -sinY + (forward) * cosY;
+        const len = Math.hypot(mvx, mvz) || 1;
+        mvx /= len; mvz /= len;
+        dx = mvx * speed;
+        dz = mvz * speed;
+      } else {
+        dx = 0; dz = 0;
+      }
+
+      // Apply velocities
+      player.velocity.x = dx;
+      player.velocity.z = dz;
+      // gravity
+      player.velocity.y -= 12.0 * dt;
+
+      // Ground check simplistic: check block below eye height
+      const footPos = player.pos.clone();
+      footPos.y -= 0.2;
+      player.onGround = collisionAt(footPos);
+
+      if(player.onGround && player.velocity.y < 0) {
+        player.velocity.y = 0;
+      }
+      if(player.onGround && inputState.jump){
+        player.velocity.y = player.jumpVel;
+        player.onGround = false;
+      }
+
+      // Integrate axis by axis with simple collision
+      const nextPos = player.pos.clone();
+
+      // X
+      nextPos.x += player.velocity.x * dt;
+      if(!collisionAt(new THREE.Vector3(nextPos.x, player.pos.y, player.pos.z))){
+        player.pos.x = nextPos.x;
+      } else {
+        player.velocity.x = 0;
+      }
+      // Y
+      nextPos.y += player.velocity.y * dt;
+      if(!collisionAt(new THREE.Vector3(player.pos.x, nextPos.y, player.pos.z))){
+        player.pos.y = nextPos.y;
+      } else {
+        // hit ground/ceiling
+        if(player.velocity.y < 0){ // landed
+          player.onGround = true;
+        }
+        player.velocity.y = 0;
+      }
+      // Z
+      nextPos.z += player.velocity.z * dt;
+      if(!collisionAt(new THREE.Vector3(player.pos.x, player.pos.y, nextPos.z))){
+        player.pos.z = nextPos.z;
+      } else {
+        player.velocity.z = 0;
+      }
+
+      // Camera follow: place camera at eye height and orient by yaw/pitch
+      const eye = player.pos.clone();
+      // ensure eyes above floor a bit
+      if(eye.y < PLAYER_EYE) eye.y = PLAYER_EYE;
+      camera.position.set(eye.x, eye.y, eye.z);
+      // compute look target
+      const lookDir = new THREE.Vector3(
+        Math.sin(player.yaw) * Math.cos(player.pitch),
+        Math.sin(player.pitch),
+        Math.cos(player.yaw) * Math.cos(player.pitch)
+      );
+      camera.lookAt(eye.clone().add(lookDir));
+
+      // Interact: place/break on button press (single action per frame)
+      if(inputState.place || inputState.break){
+        const tgt = getBlockTarget();
+        if(tgt){
+          const bx = tgt.block.x, by = tgt.block.y, bz = tgt.block.z;
+          const tx = tgt.target.x, ty = tgt.target.y, tz = tgt.target.z;
+          if(inputState.break){
+            world.set(bx,by,bz, BLOCK_AIR);
+            world.updateMesh();
+          }
+          if(inputState.place){
+            // only place if target in bounds and currently empty
+            if(world.inBounds(tx,ty,tz) && world.get(tx,ty,tz) === BLOCK_AIR){
+              world.set(tx,ty,tz, BLOCK_DIRT);
+              world.updateMesh();
+            }
+          }
+        }
+        // simple de-bounce: require release before next action
+        // (helps avoid too many actions per second from held inputs)
+        // We don't fully clear inputState so UI buttons still show pressed.
+        inputState.place = false;
+        inputState.break = false;
+      }
+
+      // Sun/day-night rotation
+      const t = now * 0.00012;
+      sun.position.set(50*Math.sin(t), 50*Math.cos(t), 20*Math.cos(t*0.7));
+
+      updateHUD();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    // Start
+    requestAnimationFrame(animate);
+
+    // Initial camera orientation and position
+    camera.position.set(player.pos.x, player.pos.y, player.pos.z);
+    camera.lookAt(player.pos.x + Math.sin(player.yaw), player.pos.y + Math.sin(player.pitch), player.pos.z + Math.cos(player.yaw));
+
+    // Done initial setup
+    hud.innerHTML = "Loaded. Click to lock pointer. WASD / touch controls ready.";
+
+    // Tip: to run locally, serve this file with a static server:
+    // python3 -m http.server 8000  (then open http://localhost:8000)
+  </script>
+</body>
+</html>
